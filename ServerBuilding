@@ -1,0 +1,1814 @@
+#!/usr/bin/env bash
+
+# This script builds and settings a server.
+
+set -o errexit    # Exit on most errors (see the manual)
+set -o errtrace   # Make sure any error trap is inherited
+set -o nounset    # Disallow expansion of unset variables
+set -o pipefail   # Use last non-zero exit code in a pipeline
+
+# Global Variables
+#
+declare -A _VAR
+_VAR[Environment]="$(hostnamectl | grep Chassis | awk '{print $2}')"
+_VAR[Hostname]="$HOSTNAME"
+_VAR[IP]="$(hostname -I | awk '{print $2}')"
+_VAR[Firewall]="$(LANG=C sudo ufw status 2>/dev/null | grep Status: | cut -d ' ' -f 2)"
+_VAR[CPUs]="$(grep -c ^processor /proc/cpuinfo)" # number of CPUs/cores
+_VAR[Timezone]="$(timedatectl | grep -e 'Time zone' | tr -s " " | cut -d ' ' -f 4)"
+_VAR[Distribution]="$(cat /etc/*-release 2>/dev/null | grep DISTRIB_ID | cut -d= -f2)"
+_VAR['Distro Codename']="$(cat /etc/*-release 2>/dev/null | grep DISTRIB_CODENAME | cut -d= -f2)"
+_VAR['Distro Ubuntu Codename']="$(cat /etc/*-release 2>/dev/null | grep UBUNTU_CODENAME | cut -d= -f2)"
+_VAR['Version Kernel']="$(uname -r)"
+_VAR['Free/total memory']="$(free -m | xargs | awk '{print $10 " / " $8  " MB"}')"
+_VAR['Free/total disk']="$(df -h | xargs | awk '{print $11 " / " $9}')"
+# Packages Versions
+# Nginx Ver
+ver="$(apt-cache policy nginx-full | grep Candidate| cut -d' ' -f 4)"
+_VER_NGINX_CAN="${ver:0:4}"
+if [ "$(apt-cache policy nginx-full | grep Installed | cut -d' ' -f 4)" == "(none)" ]; then
+  _VER_NGINX_INS="(none)"
+else
+  ver="$(apt-cache policy nginx-full | grep Installed | cut -d' ' -f 4)"
+  _VER_NGINX_INS="${ver:0:4}"
+fi
+_VAR['Version Nginx']="${_VER_NGINX_INS} / ${_VER_NGINX_CAN}"
+# MySQL Ver
+ver="$(apt-cache policy mysql-server | grep Candidate| cut -d' ' -f 4)"
+_VER_MYSQL_CAN="${ver:0:3}"
+if [ "$(apt-cache policy mysql-server | grep Installed | cut -d' ' -f 4)" == "(none)" ]; then
+  _VER_MYSQL_INS="(none)"
+else
+  ver="$(apt-cache policy mysql-server | grep Installed | cut -d' ' -f 4)"
+  _VER_MYSQL_INS="${ver:0:3}"
+fi
+_VAR['Version MySQL']="${_VER_MYSQL_INS}  / ${_VER_MYSQL_CAN}"
+# PHP Ver
+ver="$(apt-cache policy php-fpm | grep Candidate| cut -d':' -f 3)"
+_VER_PHPFPM_CAN="${ver:0:3}"
+if [ "$(apt-cache policy php-fpm | grep Installed | cut -d' ' -f 4)" == "(none)" ]; then
+  _VER_PHPFPM_INS="(none)"
+else
+  ver="$(apt-cache policy php-fpm | grep Installed | cut -d':' -f 3)"
+  _VER_PHPFPM_INS="${ver:0:3}"
+fi
+_VAR['Version PHP-FPM']="${_VER_PHPFPM_INS}  / ${_VER_PHPFPM_CAN}"
+
+_VERSION_SCRIPT="1.0"
+_USER_WEB="www-data"
+_PATH_LETSENCRYPT_WEBROOT="/var/www/_letsencrypt/"
+_PATH_LETSENCRYPT_CERTIFICATE="/etc/letsencrypt/live/"
+_PATH_CERTIFICATES_IMPORT="/vagrant/Self-Signed Sertificates/" # only use in local virtualhost
+_PATH_ODOO_ADDONS="/opt/odoo/addons,/opt/odoo/addons_custom"
+
+usage(){
+  echo "
+  This script builds and settings a server.
+
+    Usage: $(basename "${0}") [option] [arguments]
+
+  -l                         Update and clean the system.
+  -e, --nginx                Install Nginx server.
+      --nginx-conf           Config Nginx server (update all config files).
+  -b, --nginx-block <domain> Create and modify a Nginx server block.
+      --subdomain <subdoman> Set subdomain (<subdoman>.example.com).
+  -r, --redirect <https|sub> Force SSL redirect.
+                               (http://example.com >>> https://example.com)
+                             Redirect subdomains.
+                               (*.example.com >>> example.com)
+  -s, --ssl <domain>         Create an SSL certificate for domain.
+  -p, --path <custompath>    Set custom webrot path in /vat/www/<custompath>
+                               (default: /var/www/<domain>/punbic)
+  -m, --mysql                Install MySQL server.
+      --mysql-add-user       Add MySQL user.
+  -p, --php                  Install PHP-FPM.
+      --php-admin            Install and config PhpMyAdmin.
+  -w, --wp <path>            Install WordPress (whit WP-CLI).
+                             Install and activate a plugin/theme
+                             from WP plugin directory.
+      --wp-plugin <path> <plugins>
+      --wp-theme  <path> <plugins>
+      --wp-update            Update WordPres.
+  -o, --odoo                 Build the Odoo server from source.
+  -i, --info                 Display system info.
+      --log <domain>         Show Nginx acces and error log in real-time.
+                             Whach default logs use '--log default' argument.
+  -t, --timezone             Set system timezone.
+  -g, --geoip                Install and update GeoIP2 database (MaxMind).
+  -v, --version              Display script version number.
+  -h, --help                 Display this help message.
+  "
+  exit 2
+}
+
+# Helper-function: check a package exists
+packages_exists() {
+  if [ $# -gt 1 ]; then
+    echo "  Error: Too many arguments in ${FUNCNAME[0]}() function in line: $LINENO"
+    exit 1
+  fi
+  local _PACKAGE=${1}
+  if type -P ${_PACKAGE} &>/dev/null; then
+    return 0
+  else
+    echo "
+    Dependency Warning:
+      The '${_PACKAGE}' is not installed on your system,
+      please install it and then run the script again.
+    "; exit 0
+  fi
+}
+
+info() {
+  printf "\nSystem Info (%s):\n" "$(date)"
+  echo "--------------------------------------------------"
+  local _BORDER="--------------------------------------------------"
+  _BORDER=$_BORDER$_BORDER
+  local _HEADER=" %-25s %-15s\n"
+  local _CONTENT=" %-25s %-15s\n"
+  printf "$_HEADER" "NAME" "VALUE"
+  printf "%50.50s\n" "$_BORDER"
+  for _NAME in "${!_VAR[@]}"; do
+    [[ -z "${_VAR[$_NAME]}" ]] && _VAR[$_NAME]="n/a"
+    printf "$_CONTENT" "$_NAME" "${_VAR[$_NAME]}"
+  done | sort -n
+  printf "%50.50s\n" "$_BORDER"
+  echo -e "* Version: installed / candidate\n"
+}
+
+show_log() {
+  # Display the last 3 lines of log (acces and error) files in real-time
+  # if [[ ! -f "/var/log/nginx/${_DOMAIN:-}access.log" ]]; then
+  #   echo -e "  Error: the file does not exist in the specified location:\n        /var/log/nginx/${_DOMAIN:-}.access.log " >&2
+  #   exit 1
+  # fi
+  if [[ "${_DOMAIN:-}" == "default" ]]; then
+    watch tail -n 3 /var/log/nginx/access.log /var/log/nginx/error.log
+  else
+    watch tail -n 3 /var/log/nginx/${_DOMAIN:-}.access.log /var/log/nginx/${_DOMAIN:-}.error.log
+  fi
+}
+
+linux(){
+  # Upgrading packages if necessary
+  sudo apt update
+  echo ""
+  if [[ $(LANG=C apt-get upgrade -s | grep -P '^\d+ upgraded'| cut -d" " -f1) != 0 ]]; then
+    sudo apt upgrade -y
+  fi
+
+  # System cleaning
+  #
+  # Remove leftover config files
+  if [[ -z "$(COLUMNS= dpkg -l | grep '^rc' | tr -s ' ' | cut -d ' ' -f 2)" ]]; then
+    echo "  There aren't leftover config files."
+  else
+    echo "Remove leftover config files:"
+    sudo dpkg --purge $(COLUMNS= dpkg -l | grep '^rc' | tr -s ' ' | cut -d ' ' -f 2)
+  fi
+
+  # Clean packages cache
+  sudo apt clean
+
+  # Remove orphaned packages
+  if [[ $(LANG=C apt-get autoremove -s | grep -P '^\d+ upgraded'| cut -d" " -f6) -ne 0 ]]; then
+    sudo apt autoremove -y -qq
+  fi
+
+  # Flush the cache of Linux memory
+  # sudo /sbin/sysctl vm.drop_caches=3
+
+  # UFW enable
+  sudo ufw default deny incoming &>/dev/null
+  sudo ufw default allow outgoing &>/dev/null
+  sudo ufw allow ssh comment 'SSH' &>/dev/null  && printf "  Ufw rule: allow SSH\n"
+  if [[ "${_VAR[Firewall]}" != "active" ]]; then
+    sudo ufw --force enable
+  fi
+  sudo ufw reload &>/dev/null && echo "  ✔ Firewall reloaded"
+}
+
+timezone() {
+  _TIMEZONE="$(timedatectl | grep -e 'Time zone' | tr -s " " | cut -d ' ' -f 4)"
+  # if [[ "${_TIMEZONE}" == "Etc/UTC" ]] || [[ "${_TIMEZONE}" == "" ]]; then
+    echo "Current timezone on system: ${_TIMEZONE}"
+    read -p "Do you want to set a new timezone? [y/n] " REPLY
+    if [[ "${REPLY:-}" =~ ^[Yy]$ ]]; then
+      read -p "Enter the new time zone (format: Continent/City): " _SET_TIMEZONE
+      if [[ $(timedatectl list-timezones | grep "${_SET_TIMEZONE}" &> /dev/null; echo $?) != "0" ]]; then
+        echo "  Error: '${_SET_TIMEZONE}' invalid timezone. Try again..." && exit 1
+      else
+        sudo timedatectl set-timezone "${_SET_TIMEZONE}" && echo "Done."
+        _TIMEZONE="${_SET_TIMEZONE}"
+      fi
+    fi
+  # fi
+}
+
+geoip() {
+  if ! which geoipupdate &>/dev/null; then
+    # Install GeoIP2 database
+    read -p "Do you want to install/update the GeoIP database? [y/n] " REPLY
+    if [[ "${REPLY:-}" =~ ^[Yy]$ ]]; then
+      echo "
+        NOTE: You will need an MaxMind Account ID and License Key.
+        For more information about this, visit the docs at
+        https://dev.maxmind.com/geoip/geoipupdate/
+        "
+      read -p "Do you have an account ID for MaxMind, ... (select 'no' to skip the database installation)? [y/n] " REPLY
+      if [[ "${REPLY:-}" =~ ^[Yy]$ ]]; then
+        read -p "  Enter your AccountID: " _MAXMIND_ACCOUNTID
+        read -p "  Enter your LicenseKey: " _MAXMIND_LICENSEKEY
+
+        sudo apt install -y geoipupdate
+        sudo sed -i "s/AccountID.*/AccountID ${_MAXMIND_ACCOUNTID}/g" /etc/GeoIP.conf
+        sudo sed -i "s/LicenseKey.*/LicenseKey ${_MAXMIND_LICENSEKEY}/g" /etc/GeoIP.conf
+        sudo geoipupdate -d /usr/share/GeoIP/ && echo "  ✔ GeoIP database installed"
+      fi
+    fi
+  else
+    # Update GeoIP2 database
+    if [ ! -f "/usr/share/GeoIP/.geoipupdate.lock" ]; then
+      sudo geoipupdate -d /usr/share/GeoIP/ && echo "  ✔ GeoIP database updated"
+    else
+      echo "  ✔ GeoIP database is up to date"
+    fi
+  fi
+}
+
+domain_validate(){
+  # Domain validate (simple)
+  if [[ $(echo ${_DOMAIN:-} | grep -P "^[a-zA-Z0-9][a-zA-Z0-9-]{1,61}[a-zA-Z0-9](?:\.[a-zA-Z]{2,})+$"; echo  $?) == 1 ]] && [ "${_DOMAIN:-}" != "default" ]; then
+    echo -e "\n  Info: The '${_DOMAIN:-}' is not a valid domain name."
+    read -p "  Do you want to continue? [y/n] " REPLY
+    echo ""
+    if [[ "${REPLY:-}" =~ ^[Nn]$ ]]; then
+      exit 0
+    fi
+  fi
+}
+
+ssl_certificate() {
+  if [ "${_DOMAIN}" == "default" ]; then
+    _DOMAIN=${_VAR[Hostname]}
+  fi
+  ##
+  # Self-signed certificate in local environment
+  ##
+  if [[ "${_VAR[Environment]}" == "vm" ]]; then
+    if [ ! -f "${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem" ]; then
+      sudo mkdir -p ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}
+      sudo cp -rf /etc/ssl/openssl.cnf /tmp/openssl.${_DOMAIN:-}.cnf
+      sudo sed -i "1i SAN=\"email:info@${_DOMAIN:-}\"" /tmp/openssl.${_DOMAIN:-}.cnf
+      if [[ "${_DOMAIN:-}" == "${_VAR[Hostname]}" ]]; then
+        # Create a certificate for default host
+        # Example, if hostname equal 'VPS':
+        #   -b VPS      Default host available at https://${_VAR[IP]}
+        #               after you imported the VPS.crt. file(s) to the Chrome web browser
+        sudo sed -i "s/^# Extensions for a typical CA/subjectAltName=IP:${_VAR[IP]}/g" /tmp/openssl.${_DOMAIN:-}.cnf
+      else
+        sudo sed -i "s/^# Extensions for a typical CA/subjectAltName=DNS:${_DOMAIN:-}, DNS:www.${_DOMAIN:-}, DNS:*.${_DOMAIN:-}/g" /tmp/openssl.${_DOMAIN:-}.cnf
+      fi
+      # Create certificates
+      sudo openssl req \
+        -x509 -new -sha256 -days 365 -nodes -newkey rsa:2048 \
+        -subj "/C=US/ST=New York/L=New York/O=123 SSL - Local Tester/OU=IT/CN=${_DOMAIN:-}" \
+        -out ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem \
+        -keyout ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/privkey.pem \
+        -config /tmp/openssl.${_DOMAIN:-}.cnf > /dev/null 2>&1 || echo "  Error: creating self-signed certificate -- '${_DOMAIN:-}'"
+      # Fixing cURL SSL connection issue
+      cat "${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem" | sudo tee /usr/share/ca-certificates/${_DOMAIN:-}.crt > /dev/null
+      sudo bash -c "cat >> /etc/ca-certificates.conf" <<CERT
+# Fixing cURL SSL connection issue
+${_DOMAIN:-}.crt
+CERT
+      sudo update-ca-certificates --fresh > /dev/null
+    fi
+    # Import to web browsers (vagrant-triggers or manual import)
+    mkdir -p "${_PATH_CERTIFICATES_IMPORT}"
+    cat "${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem" | sudo tee "${_PATH_CERTIFICATES_IMPORT}/${_DOMAIN:-}.crt" > /dev/null && echo "  ✔ SSL cert for '${_DOMAIN:-}' is ready (import into the Chrome browser)"
+  else
+    ##
+    # Let's Encrypt certificate in production environment
+    ##
+    packages_exists "certbot"
+    if [[ $(sudo certbot certificates 2>/dev/null | grep --quiet www.${_DOMAIN:-}; echo $?) != 0 ]]; then
+      echo "You need a valid e-mail address for obtaining SSL"
+      echo "certificates from Let's Encrypt using Certbot!"
+      read -p "Enter e-mail adress:" _CERT_EMAIL
+      echo ""
+      # Diasable SSL config
+      sudo sed -i -r 's/(listen .*443)/\1;#/g; s/(ssl_(certificate|certificate_key|trusted_certificate) )/#;#\1/g' /etc/nginx/conf.d/${_DOMAIN:-}.conf
+      # Run certbot (https://certbot.eff.org/docs/using.html)
+      # Use certbot --dry-run flag to test
+      sudo certbot --nginx certonly --agree-tos --no-eff-email --email ${_CERT_EMAIL} -d ${_DOMAIN} -d www.${_DOMAIN} -d cdn.${_DOMAIN} -d doc.${_DOMAIN} -d shop.${_DOMAIN} forum.${_DOMAIN} api.${_DOMAIN} blog.${_DOMAIN} help.${_DOMAIN} info.${_DOMAIN} dev.${_DOMAIN} || _error "creating Let’s Encrypt certificate -- '${_DOMAIN}'"
+      # Re-enable SSL config
+      sudo sed -i -r 's/#?;#//g' /etc/nginx/conf.d/${_DOMAIN:-}.conf
+    fi
+    # Expand certbot with subdomain (You can use wildcard certificate too, more info at https://certbot.eff.org/docs/using.html#dns-plugins)
+    if [[ -n "${_SUB}" ]]; then
+      if [[ $(sudo certbot certificates 2>/dev/null | grep --quiet ${_SUB}${_DOMAIN}; echo $?) != 0 ]]; then
+        sudo certbot --nginx certonly --expand --agree-tos --no-eff-email -d ${_DOMAIN} -d www.${_DOMAIN} -d ${_SUB}${_DOMAIN} || _error "creating Let’s Encrypt certificate -- '${_SUB}${_DOMAIN}'"
+      fi
+    fi
+  fi
+}
+
+nginx(){
+  if which nginx &>/dev/null; then
+    echo "  ✔ The Nginx server is already installed"
+  else
+    sudo apt update
+    timezone
+    sudo apt install nginx-full -y
+    # Enable the Nginx server starting after a reboot
+    sudo systemctl enable nginx &>/dev/null
+    # Allow UFW for Nginx
+    sudo ufw allow 'Nginx Full' comment 'server' &>/dev/null && echo "  Ufw rule: allow Nginx Full"
+    echo "  ✔ The Nginx server is installed"
+    nginx_config
+    _DOMAIN="default"
+    nginx_block
+  fi
+}
+
+nginx_config() {
+  packages_exists "nginx"
+
+  if ! which certbot &>/dev/null; then
+    sudo apt -y install certbot python3-certbot-nginx
+    # Notes: The 'ssl-dhparams.pem' file will be created after installing and run certbot.
+    sudo certbot --dry-run renew # there is nothing renewable yet
+  fi
+  sudo systemctl enable certbot.timer
+
+  # Add a Diffie-Hellman parameter
+  # if [ ! -f "/etc/letsencrypt/ssl-dhparams.pem" ]; then
+  #   sudo mkdir -p /etc/letsencrypt/
+  #   echo "
+  #   Generating DH parameters...
+  #     - Only need to be generated once if it is not exists!
+  #     - This is going to take a few (10-15) minutes.
+  #   "
+  #   # Generate a Diffie-Hellman parameter
+  #   sudo openssl genpkey -genparam -algorithm DH -out /etc/letsencrypt/ssl-dhparams.pem -pkeyopt dh_paramgen_prime_len:4096 > /dev/null 2>&1
+  # fi
+
+  sudo bash -c "cat > /etc/nginx/nginx.conf" << NGINXCONFIG
+##
+# Nginx Config
+##
+user                         ${_USER_WEB};
+pid                          /run/nginx.pid;
+worker_processes             auto;
+worker_rlimit_nofile         65535;
+include                      /etc/nginx/modules-enabled/*.conf;
+
+events {
+  multi_accept               on;
+  worker_connections         65535;
+}
+
+http {
+    charset                  utf-8;
+    sendfile                 on;
+    tcp_nopush               on;
+    tcp_nodelay              on;
+    server_tokens            off;
+    log_not_found            off;
+    types_hash_max_size      2048;
+    client_max_body_size     16M;
+
+    # MIME
+    include                  /etc/nginx/mime.types;
+    default_type             application/octet-stream;
+
+    # Logging
+    log_format custom        '[\$time_local] \$remote_addr \$remote_user  '
+                             '"\$request" \$status \$body_bytes_sent '
+                             '"\$http_referer" "\$http_user_agent" '
+                             '"\$http_x_forwarded_for" \$request_id '
+                             '\$geoip_country_name \$geoip_country_code '
+                             '\$geoip_region_name \$geoip_city ';
+    access_log               /var/log/nginx/access.log custom;
+    error_log                /var/log/nginx/error.log warn;
+
+    # Limits
+    limit_req_log_level      warn;
+    limit_req_zone           \$binary_remote_addr zone=login:10m rate=10r/m;
+
+    # SSL
+    ssl_session_timeout      1d;
+    ssl_session_cache        shared:SSL:10m;
+    ssl_session_tickets      off;
+NGINXCONFIG
+
+  if [ -f "/etc/letsencrypt/ssl-dhparams.pem" ]; then
+    sudo bash -c "cat >> /etc/nginx/nginx.conf" << NGINXCONFIG
+    ssl_dhparam              /etc/letsencrypt/ssl-dhparams.pem;
+NGINXCONFIG
+  fi
+
+  sudo bash -c "cat >> /etc/nginx/nginx.conf" << NGINXCONFIG
+    ssl_protocols            TLSv1.2 TLSv1.3;
+    ssl_ciphers              ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+
+NGINXCONFIG
+
+  if [[ "${_VAR[Environment]}" != "vm" ]]; then
+    sudo bash -c "cat >> /etc/nginx/nginx.conf" << NGINXCONFIG
+    ssl_stapling           on;
+    ssl_stapling_verify    on;
+    resolver               1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 208.67.222.222 208.67.220.220 valid=60s;
+    resolver_timeout       2s;
+
+NGINXCONFIG
+  fi
+
+  if [ -f "/usr/share/GeoIP/GeoLite2-Country.mmdb" ]; then
+    sudo bash -c "cat >> /etc/nginx/nginx.conf" <<NGINXCONFIG
+    # GeoIP Database
+    geoip2 /usr/share/GeoIP/GeoLite2-Country.mmdb {
+        auto_reload 60m;
+        \$geoip2_data_country_code country iso_code;
+        \$geoip2_data_country_name country names en;
+    }
+
+    geoip2 /usr/share/GeoIP/GeoLite2-City.mmdb {
+        auto_reload 60m;
+        \$geoip2_metadata_city_build metadata build_epoch;
+        \$geoip2_data_city_name city names en;
+    }
+
+    # Block countries
+    # map $geoip2_data_country_code \$domain_allowed_country {
+    #     default yes;
+    #     RU no;
+    # }
+    # You need to determine in the server block configuration
+    # what to do if the country is not allowed...
+    # Example:
+    #     location / {
+    #         if (\$domain_allowed_country = no) {
+    #           return 444;
+    #         }
+    #     }
+
+NGINXCONFIG
+  fi
+
+  sudo bash -c "cat >> /etc/nginx/nginx.conf" << NGINXCONFIG
+    # Virtual Host Configs
+    include                  /etc/nginx/conf.d/*.conf;
+}
+NGINXCONFIG
+
+  sudo bash -c "cat > /etc/nginx/snippets/letsencrypt.conf" <<NGINXLETSENCRYPT
+##
+# ACME-challenge
+##
+location ^~ /.well-known/acme-challenge/ {
+    root                    ${_PATH_LETSENCRYPT_WEBROOT};
+}
+NGINXLETSENCRYPT
+
+  sudo bash -c "cat > /etc/nginx/snippets/general.conf" <<NGINXGENERAL
+##
+# General Config
+##
+location = /favicon.ico {
+    log_not_found            off;
+    access_log               off;
+}
+
+location = /robots.txt {
+    log_not_found            off;
+    access_log               off;
+}
+
+# Cache-Control - Expiration
+location ~* \.(?:css(\.map)?|js(\.map)?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4a|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv)\$ {
+    expires                  7d;
+    access_log               off;
+}
+
+location ~* \.(?:svgz?|ttf|ttc|otf|eot|woff2?)\$ {
+    add_header Access-Control-Allow-Origin "*";
+    expires                  7d;
+    access_log               off;
+}
+
+# Gzip
+gzip                         on;
+gzip_vary                    on;
+gzip_proxied                 any;
+gzip_comp_level              6;
+gzip_types                   text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+NGINXGENERAL
+
+  sudo bash -c "cat > /etc/nginx/snippets/fastcgi-php.conf" <<FASTCGICONFIG
+##
+# PHP FastCGI config
+##
+
+# 404
+try_files                    \$fastcgi_script_name =404;
+
+# default fastcgi_params
+include                      /etc/nginx/fastcgi_params;
+
+# fastcgi settings
+fastcgi_pass                 unix:/var/run/php/php-fpm.sock;
+fastcgi_index                index.php;
+fastcgi_buffers              8 16k;
+fastcgi_buffer_size          32k;
+
+# fastcgi params
+fastcgi_param DOCUMENT_ROOT   \$realpath_root;
+fastcgi_param SCRIPT_FILENAME \$realpath_root\$fastcgi_script_name;
+fastcgi_param PHP_ADMIN_VALUE "open_basedir=\$base/:/usr/lib/php/:/tmp/:/usr/share/phpmyadmin/";
+FASTCGICONFIG
+  # If GeoIP database exists add this below to php-fastcgi.conf
+  if [ -f "/usr/share/GeoIP/GeoLite2-Country.mmdb" ]; then
+    sudo bash -c "cat >> /etc/nginx/snippets/fastcgi-php.conf" <<FASTCGICONFIG
+fastcgi_param COUNTRY_CODE   \$geoip2_data_country_code;
+fastcgi_param COUNTRY_NAME   \$geoip2_data_country_name;
+fastcgi_param CITY_NAME      \$geoip2_data_city_name;
+FASTCGICONFIG
+fi
+
+  sudo bash -c "cat > /etc/nginx/snippets/proxy.conf" <<PROXYCONFIG
+##
+# Proxy Config (proxy_params)
+##
+proxy_http_version                 1.1;
+proxy_cache_bypass                 \$http_upgrade;
+
+# Proxy headers
+proxy_set_header Upgrade           \$http_upgrade;
+proxy_set_header Connection        "upgrade";
+proxy_set_header Host              \$host;
+proxy_set_header X-Real-IP         \$remote_addr;
+proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+proxy_set_header X-Forwarded-Proto \$scheme;
+proxy_set_header X-Forwarded-Host  \$host;
+proxy_set_header X-Forwarded-Port  \$server_port;
+
+# Proxy timeouts
+proxy_connect_timeout              60s;
+proxy_send_timeout                 60s;
+proxy_read_timeout                 60s;
+PROXYCONFIG
+
+  sudo bash -c "cat > /etc/nginx/snippets/security.conf" <<NGINXSECURITY
+##
+# Security Config
+##
+add_header X-Frame-Options           "SAMEORIGIN" always;
+add_header X-XSS-Protection          "1; mode=block" always;
+add_header X-Content-Type-Options    "nosniff" always;
+add_header Referrer-Policy           "no-referrer-when-downgrade" always;
+add_header Content-Security-Policy   "default-src * data: 'unsafe-eval' 'unsafe-inline'" always;
+# add_header Content-Security-Policy   "default-src 'self' http: https: data: blob: 'unsafe-inline'" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header "X-UA-Compatible" "IE=Edge";
+
+location ~ /\.(?!well-known) {
+    deny all;
+}
+NGINXSECURITY
+
+  sudo bash -c "cat > /etc/nginx/snippets/phpmyadmin.conf" <<NGINXPHPADMIN
+##
+# PhpMyAdmin Config
+##
+location /phpmyadmin {
+    root /usr/share/;
+
+    location ~ ^/phpmyadmin/(doc|sql|setup|libraries|templates)/ {
+        return 404;
+    }
+
+    location ~ ^/phpmyadmin/(.+\.php)\$ {
+        include /etc/nginx/snippets/fastcgi-php.conf;
+    }
+
+    location ~* ^/phpmyadmin/(.+\.(jpg|jpeg|gif|css|png|js|ico|html|xml|txt))\$ {
+        root /usr/share/;
+    }
+}
+NGINXPHPADMIN
+
+  sudo bash -c "cat > /etc/nginx/snippets/wordpress.conf" <<WORDPRESSCONFIG
+##
+# WordPress config
+##
+
+# WordPress: allow TinyMCE
+# location = /wp-includes/js/tinymce/wp-tinymce.php {
+#     include /etc/nginx/snippets/fastcgi-php.conf;
+# }
+
+# WordPress: deny wp-content, wp-includes php files
+# location ~* ^/(?:wp-content|wp-includes)/.*\.php\$ {
+#     deny all;
+# }
+
+# WordPress: deny wp-content/uploads nasty stuff
+# location ~* ^/wp-content/uploads/.*\.(?:s?html?|php|js|swf)\$ {
+#     deny all;
+# }
+
+# WordPress: SEO plugin
+# location ~* ^/wp-content/plugins/wordpress-seo(?:-premium)?/css/main-sitemap\.xsl\$ {}
+
+# WordPress: deny wp-content/plugins (except earlier rules)
+# location ~ ^/wp-content/plugins {
+#     deny all;
+# }
+
+# WordPress: deny scripts and styles concat
+# location ~* \/wp-admin\/load-(?:scripts|styles)\.php {
+#     deny all;
+# }
+
+# WordPress: deny general stuff
+# location ~* ^/(?:xmlrpc\.php|wp-links-opml\.php|wp-config\.php|wp-config-sample\.php|wp-comments-post\.php|readme\.html|license\.txt)\$ {
+#     deny all;
+# }
+
+# WordPress: throttle wp-login.php
+location = /wp-login.php {
+    limit_req zone=login burst=2 nodelay;
+    include   /etc/nginx/snippets/fastcgi-php.conf;
+}
+WORDPRESSCONFIG
+
+  sudo nginx -s reload && echo "  ✔ Nginx Server setting and reloading is OK"
+}
+
+
+nginx_block(){
+  domain_validate
+  ssl_certificate
+
+  if [[ "${_DOMAIN:-}" == "${_VAR[Hostname]}" ]]; then
+    _DOMAIN="default"
+  fi
+
+  sudo rm -rf /etc/nginx/{sites-enabled/default,sites-available/default}
+  if [[ "${_DOMAIN:-}" == "default" ]]; then
+    sudo bash -c "cat > /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+DEFAULTBLOCK
+
+    if [ -f "${_PATH_LETSENCRYPT_CERTIFICATE}${_VAR[Hostname]}/fullchain.pem" ]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+    listen 443 ssl http2 default_server;
+    listen [::]:443 ssl http2 default_server;
+    ssl_certificate ${_PATH_LETSENCRYPT_CERTIFICATE}${_VAR[Hostname]}/fullchain.pem;
+    ssl_certificate_key ${_PATH_LETSENCRYPT_CERTIFICATE}${_VAR[Hostname]}/privkey.pem;
+
+DEFAULTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+    set  \$base /var/www/html;
+    root \$base;
+
+    index index.php index.html index.htm index.nginx-debian.html;
+
+    server_name _;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+DEFAULTBLOCK
+
+    if [ -d "/usr/share/phpmyadmin" ]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+    include /etc/nginx/snippets/phpmyadmin.conf;
+
+DEFAULTBLOCK
+    fi
+
+    if [[ "${_VAR[Environment]}" != "vm" ]]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+    ##
+    # CONNECTION CLOSED WITHOUT RESPONSE
+    ##
+    return 444;
+DEFAULTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/default.conf" << DEFAULTBLOCK
+}
+DEFAULTBLOCK
+
+  else
+    ##
+    # Creating a block for VHOST
+    ##
+
+    # Set server paths
+    if [[ -n "${_SUB:-}" ]]; then
+      _SUB="${_SUB:-}."
+    fi
+    if [[ -n "${_PATH_WEBROOT_CUSTOM:-}" ]]; then
+      _PATH_WEBROOT="/var/www/${_PATH_WEBROOT_CUSTOM:-}"
+      _PATH_WEBROOT=${_PATH_WEBROOT//\/\///} # remove a double backslash
+    else
+    _PATH_WEBROOT="/var/www/${_SUB:-}${_DOMAIN:-}/public"
+    fi
+    echo -e "\nCreating or updating a Nginx server block : "
+    echo "------------------------------------------------"
+    echo "  Domain:             ${_SUB:-}${_DOMAIN:-}"
+    echo "  Webrot:             ${_PATH_WEBROOT}"
+    echo "  Redirect https:     ${_REDIRECT_HTTPS:-false}"
+    echo "  Redirect subdomain: ${_REDIRECT_SUB:-false}"
+    echo ""
+    read -p "Are you sure? [y/n] " REPLY
+    [[ ! "${REPLY:-}" =~ ^[Yy]$ ]] && exit
+
+    # Create server path
+    sudo mkdir -p {${_PATH_WEBROOT:-},${_PATH_LETSENCRYPT_WEBROOT}}
+
+    # Set FQDN
+    _FQDN="${_VAR[IP]} ${_VAR[Hostname]}.${_DOMAIN:-} ${_VAR[Hostname]} ${_DOMAIN:-}"
+    grep "${_FQDN}" /etc/hosts &>/dev/null || printf "%s\n" "${_FQDN}" | sudo tee -a /etc/hosts > /dev/null
+
+    sudo bash -c "cat > /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+server {
+VHOSTBLOCK
+
+    if ! ${_REDIRECT_HTTPS:-false}; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    listen                   80;
+    listen                   [::]:80;
+VHOSTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    listen                   443 ssl http2;
+    listen                   [::]:443 ssl http2;
+    server_name              ${_DOMAIN:-};
+    set                      \$base /var/www/${_DOMAIN:-};
+    root                     \$base/public;
+
+    # SSL
+    ssl_certificate          ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem;
+    ssl_certificate_key      ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/privkey.pem;
+VHOSTBLOCK
+
+    if [[ "${_VAR[Environment]}" != "vm" ]]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    ssl_trusted_certificate  ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/chain.pem;
+VHOSTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+
+    # security
+    include                  /etc/nginx/snippets/security.conf;
+
+    # logging
+    access_log               /var/log/nginx/${_DOMAIN:-}.access.log;
+    error_log                /var/log/nginx/${_DOMAIN:-}.error.log warn;
+
+VHOSTBLOCK
+
+    if which php &>/dev/null; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    index                    index.php;
+VHOSTBLOCK
+    else
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    index                    index.php index.html;
+VHOSTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    # index.php fallback
+    location / {
+        try_files            \$uri \$uri/ /index.php?\$query_string;
+    }
+
+VHOSTBLOCK
+
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    # additional config
+    include                  /etc/nginx/snippets/general.conf;
+VHOSTBLOCK
+
+    if ! ${_REDIRECT_HTTPS:-false}; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    include                  /etc/nginx/snippets/letsencrypt.conf;
+VHOSTBLOCK
+    fi
+
+    if [ -d "/usr/share/phpmyadmin" ]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    include                  /etc/nginx/snippets/phpmyadmin.conf;
+VHOSTBLOCK
+    fi
+
+    if [[ -f "/var/www/${_DOMAIN:-}/public/wp-config.php" ]]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    include                  /etc/nginx/snippets/wordpress.conf;
+VHOSTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+
+    # handle .php
+    location ~ \.php\$ {
+        include              /etc/nginx/snippets/fastcgi-php.conf;
+    }
+}
+
+##
+# CDN for static contents
+##
+server {
+    listen                   443 ssl http2;
+    listen                   [::]:443 ssl http2;
+    server_name              cdn.${_DOMAIN:-};
+    root                     /var/www/${_DOMAIN:-}/public;
+
+    # SSL
+    ssl_certificate          ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem;
+    ssl_certificate_key      ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/privkey.pem;
+VHOSTBLOCK
+
+    if [[ "${_VAR[Environment]}" != "vm" ]]; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+    ssl_trusted_certificate  ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/chain.pem;
+VHOSTBLOCK
+    fi
+
+    sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+
+    # disable access_log
+    access_log               off;
+    error_log                /var/log/nginx/cdn.${_DOMAIN:-}.error.log warn;
+
+    # gzip
+    gzip                     on;
+    gzip_vary                on;
+    gzip_proxied             any;
+    gzip_comp_level          6;
+    gzip_types               text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    # allow safe files
+    location ~* \.(?:css(\.map)?|js(\.map)?|ttf|ttc|otf|eot|woff2?|svgz?|jpe?g|png|gif|ico|cur|heic|webp|tiff?|mp3|m4a|aac|ogg|midi?|wav|mp4|mov|webm|mpe?g|avi|ogv|flv|wmv|pdf|docx?|dotx?|docm|dotm|xlsx?|xltx?|xlsm|xltm|pptx?|potx?|pptm|potm|ppsx?)\$ {
+        add_header           Access-Control-Allow-Origin "*";
+        add_header           Cache-Control "public";
+        expires              360d;
+        if_modified_since    exact;
+    }
+
+    # deny everything else
+    location / {
+        deny all;
+    }
+}
+
+VHOSTBLOCK
+
+    if ${_REDIRECT_SUB:-false}; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+##
+# Subdomains Redirect
+##
+server {
+    listen                   443 ssl http2;
+    listen                   [::]:443 ssl http2;
+    server_name              *.${_DOMAIN:-};
+
+    # SSL
+    ssl_certificate          ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem;
+    ssl_certificate_key      ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/privkey.pem;
+VHOSTBLOCK
+
+      if [[ "${_VAR[Environment]}" != "vm" ]]; then
+        sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+      ssl_trusted_certificate  ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/chain.pem;
+VHOSTBLOCK
+      fi
+
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+
+    return                   301 https://${_DOMAIN:-}\$request_uri;
+}
+
+VHOSTBLOCK
+    fi
+
+    if ${_REDIRECT_HTTPS:-false}; then
+      sudo bash -c "cat >> /etc/nginx/conf.d/${_DOMAIN:-}.conf" << VHOSTBLOCK
+##
+# HTTP to HTTPS Redirect
+##
+server {
+    listen                   80;
+    listen                   [::]:80;
+    server_name              .${_DOMAIN:-};
+    include                  /etc/nginx/snippets/letsencrypt.conf;
+
+    location / {
+        return 301 https://${_DOMAIN:-}\$request_uri;
+    }
+}
+
+VHOSTBLOCK
+    fi
+
+    if which php &>/dev/null; then
+      # Add index.php
+      if [ ! -f "${_PATH_WEBROOT}/index.php" ]; then
+        sudo bash -c "cat > ${_PATH_WEBROOT}/index.php" <<INDEXPHP
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Welcome to ${_SUB:-}${_DOMAIN:-}</title>
+    <meta name="description" content="Welcome to ${_SUB:-}${_DOMAIN:-}">
+    <style>.center{text-align: center!important;}</style>
+  </head>
+  <body>
+    <?php echo '<p class="center">Welcome to ${_SUB:-}${_DOMAIN:-}</p>'; ?>
+INDEXPHP
+
+        if [[ "${_VAR[Environment]}" == "vm" ]]; then
+            sudo bash -c "cat >> ${_PATH_WEBROOT}/index.php" <<INDEXPHP
+<?php phpinfo(); phpinfo(INFO_MODULES);?>
+INDEXPHP
+        fi
+
+        sudo bash -c "cat >> ${_PATH_WEBROOT}/index.php" <<INDEXPHP
+  </body>
+</html>
+INDEXPHP
+      fi
+    else
+    # Add index.html
+      if [ ! -f "${_PATH_WEBROOT}/index.html" ]; then
+        sudo bash -c "cat > ${_PATH_WEBROOT}/index.html" <<INDEXHTML
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Welcome to ${_SUB:-}${_DOMAIN:-}</title>
+    <meta name="description" content="Welcome to ${_SUB:-}${_DOMAIN:-}">
+    <style>.center{text-align: center!important;}</style>
+  </head>
+  <body>
+    <p class="center">Welcome to ${_SUB:-}${_DOMAIN:-}</p>
+  </body>
+</html>
+INDEXHTML
+      fi
+    fi
+  fi
+
+  sudo nginx -s reload && echo "  ✔ The '${_DOMAIN:-}' server block is ready"
+}
+
+mysql(){
+  if which mysql &>/dev/null; then
+    echo "  ✔ The MySQL server is already installed"
+  else
+    # MySQL secure installation (set password for root user)
+    read -p "  Enter root (strong) password for MySQL: " -s _ROOT_MYSQL_PASS
+    echo ""
+    sudo apt -y install mysql-server
+
+    # Install password validation plugin
+    if [[ $(sudo mysql -u root -e "SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME LIKE 'validate%';" | grep ACTIVE &>/dev/null; echo $?) != 0 ]]; then
+      sudo mysql -u root <<EOF
+INSTALL PLUGIN validate_password SONAME 'validate_password.so';
+EOF
+    fi
+
+    sudo mysql -u root <<EOF
+ALTER USER 'root'@'localhost' IDENTIFIED BY '${_ROOT_MYSQL_PASS}';
+DELETE FROM mysql.user WHERE User='root' AND host NOT IN ('localhost', '127.0.0.1', '::1');
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test_%';
+FLUSH PRIVILEGES;
+EOF
+
+    # Enable the database server starting after a reboot
+    sudo systemctl enable mysql &>/dev/null
+    # Allow UFW for MySQL
+    sudo ufw allow mysql comment 'MySQL' &>/dev/null  && printf "  Ufw rule: allow MySQL\n"
+    echo "  ✔ The MySQL server is installed"
+  fi
+
+  # Generate SSL/TLS Certificates and Keys
+  # By default, MySQL stored SSL certification on this location: /var/lib/mysql
+  # Overwrite default path with '--datadir' option
+  # ca.pem               Self-signed CA certificate
+  # ca-key.pem           CA private key
+  # server-cert.pem      Server certificate
+  # server-key.pem       Server private key
+  # client-cert.pem      Client certificate
+  # client-key.pem       Client private key
+  # CN: MySQL_Server_$MYSQLVERSION_Auto_Generated_CA_Certificate
+  sudo mysql_ssl_rsa_setup --uid=mysql
+
+  # Create custom config file
+  sudo bash -c "cat > /etc/mysql/my.cnf" <<MYSQLCONFIG
+#
+# MySQL Configuration
+#
+!includedir /etc/mysql/conf.d/
+!includedir /etc/mysql/mysql.conf.d/
+
+[mysqld]
+    bind-address             = 0.0.0.0
+
+    ssl-cipher               = DHE-RSA-AES256-SHA
+    ssl-ca                   = ca.pem
+    ssl-cert                 = server-cert.pem
+    ssl-key                  = server-key.pem
+    require_secure_transport = on
+
+    character-set-server     = utf8
+    collation-server         = utf8_general_ci
+
+# [client]
+#     ssl-mode                 = VERIFY_CA
+#     ssl-ca                   = ca.pem
+#     ssl-cert                 = client-cert.pem
+#     ssl-key                  = client-key.pem
+MYSQLCONFIG
+
+  # Restart service
+  sudo systemctl restart mysql
+  printf "  ✔ Restarting MySQL Server after updating setting\n"
+}
+
+mysql_add_usser() {
+  packages_exists "mysql"
+  if ! which mysql &>/dev/null; then
+    echo "  MySQL server is not installed on your system,"
+    echo "  please install it and then run the script again."
+    exit 0
+  fi
+  echo "Add new MySQL user with root privileges..."
+  # Set name and password for new user
+  read -p "  Enter a new username for MysQL: " _USER_MYSQL
+  read -p "  Enter your password: " -s _USER_MYSQL_PASS
+  echo ""
+  # Add new MySQL user with root privileges
+  sudo mysql -u root <<EOF
+CREATE USER IF NOT EXISTS '${_USER_MYSQL}'@'localhost' IDENTIFIED BY '${_USER_MYSQL_PASS}';
+GRANT ALL PRIVILEGES ON *.* TO '${_USER_MYSQL}'@'localhost' WITH GRANT OPTION;
+CREATE USER IF NOT EXISTS '${_USER_MYSQL}'@'%' IDENTIFIED BY '${_USER_MYSQL_PASS}';
+GRANT ALL PRIVILEGES ON *.* TO '${_USER_MYSQL}'@'%' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+EOF
+  if [[ $? == 0 ]]; then
+    printf "  ✔ New MySQL user (%s) created\n" "${_USER_MYSQL}"
+  fi
+}
+
+mysql_info() {
+  packages_exists "mysql"
+  # Show databases
+  sudo mysql -u root -e "SHOW DATABASES;"
+
+  # Show users
+  sudo mysql -u root -e  "SELECT User, Host, authentication_string FROM mysql.user;"
+
+  # Show password validation status
+  sudo mysql -u root -e "SELECT PLUGIN_NAME, PLUGIN_STATUS FROM INFORMATION_SCHEMA.PLUGINS WHERE PLUGIN_NAME LIKE 'validate%';"
+  sudo mysql -u root -e "SHOW VARIABLES LIKE 'validate%';"
+}
+
+php(){
+  if which php &>/dev/null; then
+    echo "  ✔ The PHP-FPM is already installed"
+  else
+    # Install PHP and PHP Modules
+    sudo apt -y install php-common php-fpm php-mysql php-xmlrpc php-gd php-xml php-mbstring php-cli php-zip php-soap php-curl php-imagick php-bcmath
+    # Enable PHP-FPM after a reboot
+    sudo systemctl enable php${_VER_PHPFPM_CAN}-fpm &>/dev/null
+  fi
+
+  sudo bash -c "cat > /etc/php/${_VER_PHPFPM_CAN}/fpm/conf.d/myphp.ini" <<EOF
+;
+; PHP Configuration
+;
+cgi.fix_pathinfo = 0
+memory_limit = 1024M
+post_max_size = 64M
+upload_max_filesize = 64M
+max_execution_time = 300
+max_input_time = 1000
+max_input_vars = 3000
+session.cookie_secure = 1
+session.use_only_cookies = 1
+session.use_strict_mode = 1
+log_errors = On
+error_reporting = E_ALL
+display_errors = Off
+error_log = /var/log/php_error.log
+date.timezone = ${_VAR[Timezone]}
+disable_functions = exec,shell_exec,pcntl_alarm,pcntl_fork,pcntl_waitpid,pcntl_wait,pcntl_wifexited,pcntl_wifstopped,pcntl_wifsignaled,pcntl_wifcontinued,pcntl_wexitstatus,pcntl_wtermsig,pcntl_wstopsig,pcntl_signal,pcntl_signal_dispatch,pcntl_get_last_error,pcntl_strerror,pcntl_sigprocmask,pcntl_sigwaitinfo,pcntl_sigtimedwait,pcntl_exec,pcntl_getpriority,pcntl_setpriority,
+[curl]
+; A default value for the CURLOPT_CAINFO option. This is required to be an
+; absolute path.
+curl.cainfo = "/var/www/digimager.loc/public/cacert.pem"
+EOF
+
+  # Restart service
+  sudo systemctl restart php${_VER_PHPFPM_CAN}-fpm
+  if hash nginx 2>/dev/null; then
+    sudo systemctl restart nginx && printf "  ✔ Restarting Nginx after updating PHP settings\n"
+  fi
+}
+
+phpmyadmin(){
+  packages_exists "php"
+  local _VER_PHP_MYADMIN="5.0.2"
+  # PhpMyAdmin
+  # Update PhpMyAdmin: remove /usr/share/phpmyadmin and run this script with `--php-admin` command
+  if [ ! -d "/usr/share/phpmyadmin" ]; then
+    sudo mkdir -p /usr/share/phpmyadmin
+    if [ ! -d "/tmp/phpMyAdmin-${_VER_PHP_MYADMIN}-english/" ]; then
+      wget -qO- https://files.phpmyadmin.net/phpMyAdmin/${_VER_PHP_MYADMIN}/phpMyAdmin-${_VER_PHP_MYADMIN}-english.tar.gz -O /tmp/phpMyAdmin-${_VER_PHP_MYADMIN}-english.tar.gz
+      tar -xvzf /tmp/phpMyAdmin-${_VER_PHP_MYADMIN}-english.tar.gz -C /tmp
+      sudo mv -f /tmp/phpMyAdmin-${_VER_PHP_MYADMIN}-english/* /usr/share/phpmyadmin/
+    fi
+  fi
+
+  # PhpMyAdmin config file
+  if ! hash  pwgen 2>/dev/null; then sudo apt-get -y install pwgen; fi ;
+  local _BLOWFISH_SEC=$(pwgen -s 32 1)
+
+  sudo bash -c "cat > /usr/share/phpmyadmin/config.inc.php" <<PHPMYADMINCONFIG
+<?php
+/* Servers configuration */
+\$i = 0;
+/* Server: localhost [1] */
+\$i++;
+\$cfg['Servers'][\$i]['verbose']           = '';
+\$cfg['Servers'][\$i]['host']              = '127.0.0.1';
+\$cfg['Servers'][\$i]['port']              = '';
+\$cfg['Servers'][\$i]['socket']            = '';
+\$cfg['Servers'][\$i]['auth_type']         = 'cookie';
+\$cfg['Servers'][\$i]['user']              = '';
+\$cfg['Servers'][\$i]['password']          = '';
+\$cfg['Servers'][\$i]['AllowRoot']         = false;
+\$cfg['Servers'][\$i]['extension']         = 'mysqli';
+\$cfg['Servers'][\$i]['ssl']               = true;
+\$cfg['Servers'][\$i]['ssl_verify']        = false;
+\$cfg['Servers'][\$i]['ssl_ca']            = '/var/lib/certs/ca.pem';
+\$cfg['Servers'][\$i]['ssl_cert']          = '/var/lib/client-cert.pem';
+\$cfg['Servers'][\$i]['ssl_key']           = '/var/lib/client-key.pem';
+\$cfg['blowfish_secret']                   = '${_BLOWFISH_SEC}';
+\$cfg['DefaultLang']                       = 'en';
+\$cfg['ServerDefault']                     = 1;
+\$cfg['UploadDir']                         = '/usr/share/phpmyadmin/backup/';
+\$cfg['SaveDir']                           = '/usr/share/phpmyadmin/backup/';
+\$cfg['BZipDump']                          = false;
+\$cfg['PmaNoRelation_DisableWarning']      = true;
+\$cfg['NavigationDisplayLogo']             = false;
+\$cfg['LoginCookieValidityDisableWarning'] = true;
+\$cfg['Server']['hide_db']                 = '';
+\$cfg['collation_connection']              = 'utf8_unicode_ci';
+\$cfg['VersionCheck']                      = false;
+?>
+PHPMYADMINCONFIG
+
+  # Create folder and set folders premissions for PhpMyAdmin
+  sudo mkdir -p /usr/share/phpmyadmin/backup
+  sudo chown -R ${_USER_WEB}:${_USER_WEB} /usr/share/phpmyadmin
+  sudo chmod 755 -R /usr/share/phpmyadmin
+  if [ -f "/usr/share/phpmyadmin/tmp" ]; then
+    sudo chmod 700 /usr/share/phpmyadmin/tmp
+  fi
+  sudo chmod 644 /usr/share/phpmyadmin/config.inc.php
+
+  # Restart service
+  sudo systemctl restart php${_VER_PHPFPM_INS}-fpm
+  if hash nginx 2>/dev/null; then
+    sudo systemctl restart nginx && printf "  ✔ Restarting Nginx after updating PhpMyAdmin settings\n"
+  fi
+}
+
+file_permissions() {
+  # Set server default
+  if [[ $(stat -c '%a' /var/www/) != 755 ]]; then
+    sudo find /var/www/ -exec chown ${_USER_WEB}:${_USER_WEB} {} \;
+    sudo find /var/www/ -type d -exec chmod 755 {} \;
+    sudo find /var/www/ -type f -exec chmod 644 {} \;
+  else
+    echo "  ✔ Server root folder [ /var/www/ ] premission is ok"
+  fi
+}
+
+odoo() {
+  local _VER_ODOO="13.0"
+
+  # Odoo install
+  if [ ! -f "/opt/odoo/odoo-bin" ]; then
+    read -p "Do you want to install the Odoo server? [y/n] " REPLY
+    [[ ${REPLY:-} =~ ^[Nn]$ ]] && exit 0
+
+    printf "\nOdoo uses PostgreSQL as database management system.\n\nUser name: odoo\n"
+    read -p "Enter the password for Odoo PostgreSQL 'odoo' user: " -s _USER_ODDO_PASS
+    echo ""
+
+    # Install dependencies
+    sudo apt -y install postgresql postgresql-client \
+      python3-pip libxml2-dev libxslt1-dev libldap2-dev libsasl2-dev libevent-dev \
+      node-clean-css node-less \
+      git
+
+    # Create odoo PostgreSQL User
+    if ! sudo su - postgres -c "psql -c '\du'" | grep odoo > /dev/null; then
+      # Create user with password (https://www.postgresql.org/docs/10/sql-createuser.html)
+      sudo su - postgres -c "psql -c \"CREATE USER odoo WITH PASSWORD '${_USER_ODDO_PASS}' CREATEDB NOSUPERUSER NOCREATEROLE;\""
+      # Add user to system user
+      sudo adduser --system --home=/opt/odoo --group odoo
+    fi
+
+    # Download Odoo
+    sudo git clone https://github.com/odoo/odoo.git --depth 1 --branch ${_VER_ODOO} --single-branch /opt/odoo
+
+    # Install python dependencies
+    # sudo -H pip3 install odoo-autodiscover setuptools-odoo
+    sudo -H pip3 install setuptools wheel geoip2
+    sudo -H pip3 install odoo-autodiscover # for downloading third-party modules
+    sudo -H pip3 install -r /opt/odoo/requirements.txt
+    sudo -H pip3 install -r /opt/odoo/doc/requirements.txt
+    cd /opt/odoo
+    sudo -H pip3 install -U pip
+    sudo -H pip3 install -e .
+    # python -c "import odoo.api"
+    cd
+  else
+      echo "  ✔ Odoo is already installed...\n"
+      # Odoo update
+      echo "Updating Odoo..."
+      cd /opt/odoo
+      sudo git fetch origin ${_VER_ODOO}
+      sudo git reset --hard origin/${_VER_ODOO}
+      cd
+      # Install python dependencies
+      sudo -H pip3 install -r /opt/odoo/requirements.txt > /dev/null
+      sudo -H pip3 install -r /opt/odoo/doc/requirements.txt > /dev/null
+  fi
+
+  # Enterprise Addons
+  #
+  # The Enterprise git repository does not contain the full Odoo source code.
+  # You need to clone both the Community and Enterprise repository to have
+  # a working Odoo Enterprise installation. You need to be an offical Odoo partner
+  # and you need access to https://github.com/odoo/enterprise.git
+  read -p "Do you want to install the Odoo Enterprise too? [y/n] " REPLY
+  if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
+
+    if [ ! -d "/opt/odoo/addons_enterprise/.git" ]; then
+      printf "\nInstall Odoo Enterprise Addons...\n\n"
+
+      if [[ $(sudo git clone https://github.com/odoo/enterprise.git --depth 1 --branch ${_VER_ODOO} --single-branch "/opt/odoo/addons_enterprise" &> /dev/null; echo $?) != "0" ]]; then
+        printf "\nError: Your authentication with Github or the right of\n       access to Odoo Enterprise has failed!\n       Please try again.\n\n"
+        printf ""
+        exit 1
+      fi
+
+      sudo chown -R odoo: /opt/odoo/addons_enterprise
+      _PATH_ODOO_ADDONS="/opt/odoo/addons,/opt/odoo/addons_custom,/opt/odoo/addons_enterprise"
+    else
+      # Odoo Enterprise update
+      echo "Updating Odoo Enterprise..."
+      cd /opt/odoo/addons_enterprise
+      sudo git fetch origin ${_VER_ODOO}
+      sudo git reset --hard origin/${_VER_ODOO}
+      cd
+    fi
+  fi
+  # Enable config at first install
+  odoo_config
+  _WKHTMLTOPDF=true
+}
+
+odoo_config(){
+  local _ODO_MANAGE_DB=false
+  local _USER_ODOO_MASTER_PASS="admin"
+  local _ODOO_DB_FILTER=""
+
+  if [ -d "/home/vagrant" ]; then
+    _ODO_MANAGE_DB="true"
+  fi
+
+  # Don't overwrite some existing variables
+  if [ -f "/etc/odoo-server.conf" ]; then
+    if [[ $(sudo grep admin_passwd /etc/odoo-server.conf | cut -d' ' -f3) != "admin" ]]; then
+      _USER_ODOO_MASTER_PASS=$(sudo grep admin_passwd /etc/odoo-server.conf | cut -d' ' -f3)
+    fi
+    if [[ $(sudo grep dbfilter /etc/odoo-server.conf | cut -d' ' -f3) != "" ]]; then
+      _ODOO_DB_FILTER=$(sudo grep dbfilter /etc/odoo-server.conf | cut -d' ' -f3)
+    fi
+  fi
+
+  # Config file
+  _TOTAL_MEMORY_BYTES="$(free -b | grep Mem | awk '{print $2}')"
+  _MAX_WORKERS=$((${_VAR[CPUs]}*2+1)) # number of CPUs/cores*2+1
+  # ((0.8*150MB) + (0.2*1024MB)) for 1 worker ~ 324800000 Bytes
+  _MEMORY_REQUIREMENT="324800000"
+
+  sudo bash -c "cat > /etc/odoo-server.conf" <<ODOCONFIG
+[options]
+addons_path = ${_PATH_ODOO_ADDONS}
+admin_passwd = ${_USER_ODOO_MASTER_PASS}
+csv_internal_sep = ,
+data_dir = /opt/odoo/.local/share/Odoo
+db_host = False
+db_maxconn = 64
+db_name = False
+db_password = FALSE
+db_port = False
+db_sslmode = prefer
+db_template = template0
+db_user = odoo
+dbfilter = ${_ODOO_DB_FILTER}
+demo = {}
+email_from = False
+geoip_database = /usr/share/GeoIP/GeoLite2-City.mmdb
+http_enable = True
+http_interface =
+http_port = 8069
+import_partial =
+max_cron_threads = 1
+workers = $((${_MAX_WORKERS}-1))
+limit_memory_hard = $((${_MEMORY_REQUIREMENT}*${_MAX_WORKERS}*125/100))
+limit_memory_soft = $((${_MEMORY_REQUIREMENT}*${_MAX_WORKERS}))
+limit_request = 8192
+limit_time_cpu = 600
+limit_time_real = 1200
+limit_time_real_cron = -1
+list_db = ${_ODO_MANAGE_DB}
+log_db = False
+log_db_level = warning
+log_handler = :INFO
+log_level = info
+logfile = None
+logrotate = False
+longpolling_port = 8072
+osv_memory_age_limit = 1.0
+osv_memory_count_limit = False
+pg_path = None
+pidfile = None
+proxy_mode = True
+reportgz = False
+server_wide_modules = base,web
+smtp_password = False
+smtp_port = 25
+smtp_server = localhost
+smtp_ssl = False
+smtp_user = False
+syslog = False
+test_enable = False
+test_file = False
+test_tags = None
+translate_modules = ['all']
+unaccent = False
+without_demo = True
+# Disable direct access to your Odoo instance
+# xmlrpc = True
+# xmlrpc_interface = 127.0.0.1
+# xmlrpc_port = 8069
+# xmlrpcs = True
+# xmlrpcs_interface = 127.0.0.1
+# xmlrpcs_port = 8071
+ODOCONFIG
+
+  # Odoo init script
+  if [ -f "/lib/systemd/system/odoo-server.service" ]; then
+    _RELOAD_DEAMON=true
+  fi
+
+  sudo bash -c "cat > /lib/systemd/system/odoo-server.service" <<ODOOINIT
+[Unit]
+Description=Odoo Open Source ERP and CRM
+Requires=postgresql.service
+After=network.target postgresql.service
+[Service]
+Type=simple
+PermissionsStartOnly=true
+SyslogIdentifier=odoo-server
+User=odoo
+Group=odoo
+ExecStart=/opt/odoo/odoo-bin --config=/etc/odoo-server.conf --addons-path="${_PATH_ODOO_ADDONS}"
+WorkingDirectory=/opt/odoo/
+StandardOutput=journal+console
+[Install]
+WantedBy=multi-user.target
+ODOOINIT
+
+  # Reload deamon because of the modify (update)
+  if ${_RELOAD_DEAMON:-false}; then
+    sudo systemctl daemon-reload > /dev/null
+  fi
+
+  # Create custom addons folder and a dummy module
+  sudo mkdir -p /opt/odoo/addons_custom
+  if [ ! -d "/opt/odoo/addons_custom/dummy-modul" ]; then
+    sudo /opt/odoo/odoo-bin scaffold dummy-modul /opt/odoo/addons_custom/
+  fi
+
+  # Set ownership and permissions
+  sudo chmod 755 /lib/systemd/system/odoo-server.service
+  sudo chown root: /lib/systemd/system/odoo-server.service
+  sudo chown -R odoo: /opt/{odoo,odoo/addons_custom}
+  if [ -d "/var/log/odoo/" ]; then
+    sudo chown odoo:root /var/log/odoo/
+  fi
+  sudo chown odoo: /etc/odoo-server.conf
+  sudo chmod 640 /etc/odoo-server.conf
+
+  # Allow UFW for Odoo
+  sudo ufw allow 8069/tcp comment 'Odoo Server' &>/dev/null # && printf "Ufw rule: allow Odoo server\n"
+
+  # Install Wkhtmltopdf dependencies
+  #
+  if ${_WKHTMLTOPDF:-false}; then
+    wget https://github.com/wkhtmltopdf/wkhtmltopdf/releases/download/0.12.5/wkhtmltox_0.12.5-1.bionic_amd64.deb -O /tmp/wkhtmltox.deb
+    sudo dpkg -i /tmp/wkhtmltox.deb || sudo apt --fix-broken install -y
+    sudo ln -sf /usr/local/bin/wkhtmltopdf /usr/bin
+    sudo ln -sf /usr/local/bin/wkhtmltoimage /usr/bin
+  fi
+
+  # Odoo service
+  if [[ $(systemctl status odoo-server | grep Active: | cut -d ' ' -f 5) != "active" ]]; then
+    sudo systemctl enable odoo-server
+  fi
+  sudo systemctl restart odoo-server
+  printf "Odoo server is setting and running!\n"
+
+  printf "\nOpen a new browser window and visit the address:\n  $(tput sitm)$(tput setaf 244)http://%s:8069$(tput sgr0)\n" "${_VAR[IP]}"
+  printf "\nDon't forget to set the master password on this link:\n  $(tput sitm)$(tput setaf 244)http://%s:8069/web/database/manager$(tput sgr0)\n\n" "${_VAR[IP]}"
+}
+
+wp_cli(){
+  local _WP_PLUGINS=""
+  # Extend more plugins
+  # local _WP_PLUGINS="cache-enabler autoptimize wp-mail-smtp email-templates woocommerce elementor block-builder woocommerce-gateway-stripe"
+  local _WP_THEMES="twentytwenty"
+
+  # Download WP-CLI
+  if ! hash wp 2>/dev/null; then
+    sudo wget https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar -O /usr/local/bin/wp
+    sudo chmod +x /usr/local/bin/wp
+    echo "WordPress CLI Info:"
+    sudo wp --info
+    sudo wp cli update
+    # Install WP-CLI profile package to analyze what stage or hook is slow on the site
+    sudo wp package install wp-cli/profile-command --allow-root
+  else
+      echo "✔ $(wp --version) for WordPress is installed!"
+      sudo wp cli update
+  fi
+
+  # Dependency checking
+  packages_exists "nginx"
+  packages_exists "mysql"
+  packages_exists "php"
+
+  echo -e "\nEnter the number of task you want to do."
+  echo "
+  1.) WordPress installing
+  2.) WordPress setting after install
+  3.) WordPress updating
+  4.) Create child theme
+  0.) Do nothing and exiting
+  "
+  read -p "Enter a number: " REPLY
+  [[ $REPLY =~ ^[0-9]+$ ]] || { echo "  Warning: Enter a valid number!"; exit; }
+
+  if [[ "${REPLY:-}" == 0 ]]; then
+    exit 0
+  elif [[ "${REPLY:-}" == 1 ]]; then
+    # Build WP
+    if [ -f "$PWD/wp-config.php" ]; then
+      echo "WordPress is already installed!"
+      read -p "Do you want me to update WordPress? [y/n] " REPLY
+      if [[ "${REPLY:-}" =~ ^[Yy]$ ]]; then
+        _WP_UPDATE=true
+        wp_tools
+      fi
+    else
+      echo "
+      You want me to install WordPres in this location:
+      '$PWD'
+
+      Make sure that the location must be in /var/www/... and
+      just continue if you have already created a mysql user.
+      "
+      read -p "Are you sure you want to continue? [y/n] " REPLY
+
+      if [[ "${REPLY:-}" =~ ^[Nn]$ ]]; then
+        printf "Exiting...\n" && exit
+      fi
+
+      echo "
+      New Database for WordPress:
+      ---------------------------
+      "
+      read -p "Enter the database name (can be new as well): " _WP_DB_NAME
+      read -p "Enter the database user name [ !! existing user !! ]: " _WP_DB_USER
+      read -p "Enter the password for ${_WP_DB_USER} user: " -s _WP_DB_PASSWORD
+      echo "
+
+      WordPress Settings:
+      -------------------
+      "
+      read -p "Enter the address of the new site: http(s)://" _WP_URL
+      read -p "Enter the title of the new site: " _WP_TITLE
+      read -p "Enter the username of the site admin (usernames can have only alphanumeric characters, spaces, underscores, hyphens, periods, and the @ symbol): " _WP_USER
+      read -p "Enter the email address for the admin user: " _WP_USER_MAIL
+      read -p "Enter the password of the site admin: " -s _WP_USER_PASSWORD
+      echo ""
+
+      # Download WP (without the default themes and plugins)
+      if [ ! -d "$PWD/wp-includes" ]; then
+        sudo wp core download --allow-root --skip-content || echo "Error: downloading WordPress\n"
+      fi
+
+      # WP Config file
+      sudo grep "require_secure_transport = on" /etc/mysql/*.cnf > /dev/null || _SSL_DB_CONNECTION="# "
+      _WP_DB_PREF="$(printf "WP_%s_" "$RANDOM")"
+
+      sudo wp core config --allow-root --skip-check \
+        --path=${_PWD:-} \
+        --dbname=${_WP_DB_NAME} \
+        --dbuser=${_WP_DB_USER} \
+        --dbpass=${_WP_DB_PASSWORD} \
+        --dbhost=${_VAR[IP]} \
+        --dbprefix=${_WP_DB_PREF} \
+        --extra-php <<PHP
+/**
+* This tells WordPress to use an SSL connection to our MySQL database
+*/
+define('MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL);
+
+/**
+* Change the default autosave interval from 60 seconds to 5 minutes and set number (or disable) of post revisions
+*/
+define( 'AUTOSAVE_INTERVAL', 300 );
+define( 'WP_POST_REVISIONS', false );
+
+/**
+* Custom folder
+*/
+// define( 'UPLOADS', ''.'media' );
+
+/**
+* If true, you can access the optimization tool at http://domain/wp-admin/maint/repair.php
+*/
+// define( 'WP_ALLOW_REPAIR', true );
+
+/**
+* Overrides the wp_options table value for these but does not change it in the database
+*/
+// define( 'WP_SITEURL', '' );
+// define( 'WP_HOME', '' );
+
+/**
+* Cron settings
+*/
+// define( 'ALTERNATE_WP_CRON', true );
+// define( 'DISABLE_WP_CRON', 'true');
+// define( 'WP_CRON_LOCK_TIMEOUT', 900);
+
+/**
+* Disable the Plugin and Theme Editor
+*/
+define( 'DISALLOW_FILE_EDIT', true );
+
+/**
+* Jetpack developer mode
+*/
+// define( 'JETPACK_DEV_DEBUG', true );
+
+/** EDD
+* https://docs.easydigitaldownloads.com/article/185-shopping-cart-is-empty-at-checkout
+*/
+// define( 'EDD_USE_PHP_SESSIONS', false );
+
+/**
+* WP Mail SMTP Plugin settings
+*/
+// define( 'WPMS_ON', true );
+// define( 'WPMS_SMTP_PASS', 'password_here' );
+
+/**
+* Debug
+*/
+define( 'WP_DEBUG', false );
+PHP
+
+      if [[ $? != 0 ]]; then
+        echo "  Error: setting WordPress"
+      fi
+
+      # Create a database, if not exists
+      if [[ $(sudo mysql -u root -e "SHOW DATABASES;" | grep "${_WP_DB_NAME}$" &>/dev/null; echo $?) != 0 ]]; then
+        sudo wp db create --allow-root || echo "  Error: creating database for WordPress"
+      fi
+
+      # Install WP
+      sudo wp core install --allow-root --skip-email \
+        --url=${_WP_URL} \
+        --title="${_WP_TITLE}" \
+        --admin_user=${_WP_USER} \
+        --admin_password=${_WP_USER_PASSWORD} \
+        --admin_email=${_WP_USER_MAIL} || echo "  Error: installing WordPress"
+
+      # Install and activate plugin and themes instead of wordpress defaults
+      if [[ ! -z "${_WP_PLUGINS}" ]]; then
+        sudo wp plugin install --allow-root --activate ${_WP_PLUGINS}
+      fi
+      if  [[ ! -z "${_WP_THEMES}" ]]; then
+        sudo wp theme install --allow-root --activate ${_WP_THEMES}
+      fi
+
+      # Remove index.html if exists
+      if [ -f $PWD/index.html ]; then
+        sudo rm $PWD/index.html
+      fi
+    fi # ...end downloading and installing of WordPress
+
+  elif [[ "${REPLY:-}" == 2 ]]; then
+    # WorPress option settings
+    sudo wp rewrite structure --allow-root '/%postname%/'
+    sudo wp option update timezone_string --allow-root ${_VAR[Timezone]}
+    sudo wp option update date_format --allow-root  Y-m-d
+    sudo wp option update time_format --allow-root  H:i
+    sudo wp option update users_can_register --allow-root 1
+    sudo wp option update comment_registration --allow-root 1
+    # WordPress Cron
+    sudo bash -c 'echo "wp transient delete --allow-root --expired --path='$PWD' > /dev/null 2>&1" > /etc/cron.daily/wordpress'
+    sudo bash -c 'echo "wp cache flush --allow-root --path='$PWD' > /dev/null 2>&1" >> /etc/cron.daily/wordpress'
+    sudo chmod +x /etc/cron.daily/wordpress
+  elif [[ "${REPLY:-}" == 3 ]]; then
+    echo "Updating WordPres (core, db, plugins and themes)..."
+    sudo wp core update --allow-root
+    sudo wp core update-db --allow-root
+    # Note: Usually pro, paid add-ons that are not maintained in the wordpress repo should be excluded.
+    _THEME_EXCLUDED=($(wp theme list | grep 'version higher' | awk '{print $1}'))
+    EXCLUDE="${_THEME_EXCLUDED[@]}"
+    EXCLUDE="${EXCLUDE// /,}"
+    sudo wp theme update --allow-root --all --exclude=${EXCLUDE}
+    sudo wp plugin update --allow-root --all --exclude=citadela-pro,citadela-directory || echo "  Error: WordPres plugins updating"
+
+  elif [[ "${REPLY:-}" == 4 ]]; then
+    echo ""
+    read -p "Child theme slug: " WP_NEW_CHILD_SLUG
+    read -p "Child theme name: " WP_CHILD_THEME_NAME
+    read -p "Parent theme slug: " WP_PARENT_SLUG
+    echo ""
+
+    # Create a Child theme
+    sudo wp scaffold child-theme ${WP_NEW_CHILD_SLUG:-} --parent_theme=${WP_PARENT_SLUG:-} --theme_name="${WP_CHILD_THEME_NAME:-}" --allow-root --force
+  else
+    echo " Error: choose a number between 1 and 4"
+  fi
+
+  # Empty your site of all its contents
+  # sudo wp site empty --uploads --allow-root
+
+  # Remove all spam comments
+  # sudo wp comment delete $(sudo wp comment list --status=spam --format=ids --allow-root) --allow-root
+
+  # Creates 15 posts, each having 6 paragraphs of dummy lorem ipsum text imported from loripsum.net
+  # curl http://loripsum.net/api/6 | sudo wp post generate --post_content --count=15 --allow-root
+  if [ -f $PWD/wp-config.php ]; then
+    # Recommended file permissions for WordPress
+    if [[ $(stat -c '%a' $PWD/wp-config.php) != 660 ]]; then
+      # sudo chgrp ${_USER_WEB} ${_PATH_WP_ROOT:-}/wp-config.php
+      sudo chmod 660 $PWD/wp-config.php
+    fi
+
+    if [[ $(stat -c '%a' $PWD/wp-content/) != 755 ]]; then
+      # Allow wordpress to manage wp-content
+      # sudo find $PWD/wp-content -exec chgrp ${_USER_WEB} {} \;
+      sudo find $PWD/wp-content -type d -exec chmod 775 {} \;
+      sudo find $PWD/wp-content -type f -exec chmod 664 {} \;
+    fi
+  fi
+}
+
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    -h|--help)        usage           ; shift ;;
+    -i|--info)        info            ; shift ;;
+    -t|--timezone)    timezone        ; shift ;;
+    -g|--geoip)       geoip           ; shift ;;
+    -l)               linux           ; shift ;;
+    -e|--nginx)       nginx           ; shift ;;
+    --nginx-conf)     nginx_config    ; shift ;;
+    -m|--mysql)       mysql           ; shift ;;
+    --mysql-add-user) mysql_add_usser ; shift ;;
+    --mysql-info)     mysql_info      ; shift ;;
+    -p|--php)         php             ; shift ;;
+    --php-admin)      phpmyadmin      ; shift ;;
+    -o|--odoo)        odoo            ; shift ;;
+    --odoo-conf)      odoo_config     ; shift ;;
+    -v|--version)     echo "$(basename "${0}") Version: ${_VERSION_SCRIPT}"; shift ;;
+    -w|--wp)          wp_cli          ; shift ;;
+    --path)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _PATH_WEBROOT_CUSTOM=$2
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    --subdomain)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _SUB=$2
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    --log)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _DOMAIN=$2
+        show_log
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    -s|--ssl)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _DOMAIN=$2
+        ssl_certificate
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    -r|--redirect)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _OPTS_REDIRECT=$2
+          case "${_OPTS_REDIRECT}" in
+            "https") _REDIRECT_HTTPS=true ;;
+            "sub") _REDIRECT_SUB=true ;;
+            *)
+              echo " Error: '${_OPTS_REDIRECT}' is unsupported argument for '$1' option" >&2
+              exit 1
+              ;;
+          esac
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    -b|--nginx-block)
+      if [ -n "${2:-}" ] && [ ${2:0:1} != "-" ]; then
+        _DOMAIN=$2
+        _NGINX_BLOCK=true
+        shift 2
+      else
+        echo "  Error: Argument for '$1' is missing" >&2
+        exit 1
+      fi
+      ;;
+    -*|--*=) # unsupported flags
+      echo "  Error: Unsupported option '$1'" >&2
+      exit 1
+      ;;
+    *) # preserve positional arguments
+      PARAMS="$PARAMS $1"
+      shift
+      ;;
+  esac
+done
+# set positional arguments in their proper place
+eval set -- "$PARAMS"
+
+if ${_NGINX_BLOCK:-false}; then
+  nginx_block
+  # Set file premissions if necessary
+  file_permissions
+fi
