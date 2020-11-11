@@ -1490,8 +1490,9 @@ wp_cli(){
   echo "
   1.) WordPress installing
   2.) WordPress setting after install
-  3.) WordPress updating
-  4.) Create child theme
+  3.) WordPress updating (core, db, plugins and themes)
+  4.) WordPress updating (translations)
+  5.) Create child theme
   0.) Do nothing and exiting
   "
   read -p "Enter a number: " REPLY
@@ -1666,14 +1667,18 @@ PHP
     echo "Updating WordPres (core, db, plugins and themes)..."
     sudo wp core update --allow-root
     sudo wp core update-db --allow-root
-    # Note: Usually pro, paid add-ons that are not maintained in the wordpress repo should be excluded.
-    _THEME_EXCLUDED=($(wp theme list | grep 'version higher' | awk '{print $1}'))
-    EXCLUDE="${_THEME_EXCLUDED[@]}"
-    EXCLUDE="${EXCLUDE// /,}"
-    sudo wp theme update --allow-root --all --exclude=${EXCLUDE}
-    sudo wp plugin update --allow-root --all --exclude=citadela-pro,citadela-directory || echo "  Error: WordPres plugins updating"
-
+    sudo wp theme update --allow-root --all
+    sudo wp plugin update --allow-root --all
   elif [[ "${REPLY:-}" == 4 ]]; then
+    echo "Updating WordPres (translations)..."
+    echo "  Translations for core..." && sudo wp language core update --allow-root
+    echo "  Translations for themes..." && sudo wp language theme update --allow-root --all
+    echo "  Translations for plugins..." && sudo wp language plugin update --allow-root --all
+    # Generating JSON files from the po file whit WP-CLI
+    sudo wp i18n make-json wp-content/languages/ --no-purge --allow-root
+    sudo wp i18n make-json wp-content/languages/plugins/ --no-purge --allow-root
+    sudo wp i18n make-json wp-content/languages/themes/ --no-purge --allow-root
+  elif [[ "${REPLY:-}" == 5 ]]; then
     echo ""
     read -p "Child theme slug: " WP_NEW_CHILD_SLUG
     read -p "Child theme name: " WP_CHILD_THEME_NAME
