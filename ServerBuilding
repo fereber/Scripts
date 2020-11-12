@@ -1676,8 +1676,12 @@ PHP
     echo "  Translations for plugins..." && sudo wp language plugin update --allow-root --all
     # Generating JSON files from the po file whit WP-CLI
     sudo wp i18n make-json wp-content/languages/ --no-purge --allow-root
-    sudo wp i18n make-json wp-content/languages/plugins/ --no-purge --allow-root
-    sudo wp i18n make-json wp-content/languages/themes/ --no-purge --allow-root
+    if [ -d $PWD/wp-content/languages/plugins/ ]; then
+      sudo wp i18n make-json wp-content/languages/plugins/ --no-purge --allow-root
+    fi
+    if [ -d $PWD/wp-content/languages/themes/ ]; then
+      sudo wp i18n make-json wp-content/languages/themes/ --no-purge --allow-root
+    fi
   elif [[ "${REPLY:-}" == 5 ]]; then
     echo ""
     read -p "Child theme slug: " WP_NEW_CHILD_SLUG
