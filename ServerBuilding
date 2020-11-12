@@ -1464,7 +1464,7 @@ ODOOINIT
 wp_cli(){
   local _WP_PLUGINS=""
   # Extend more plugins
-  # local _WP_PLUGINS="cache-enabler autoptimize wp-mail-smtp email-templates woocommerce elementor block-builder woocommerce-gateway-stripe"
+  # local _WP_PLUGINS="${_WP_PLUGINS} code-snippets wp-mail-smtp email-templates woocommerce elementor block-builder"
   local _WP_THEMES="twentytwenty"
 
   # Download WP-CLI
@@ -1493,6 +1493,7 @@ wp_cli(){
   3.) WordPress updating (core, db, plugins and themes)
   4.) WordPress updating (translations)
   5.) Create child theme
+  6.) Install and activate plugin(s)
   0.) Do nothing and exiting
   "
   read -p "Enter a number: " REPLY
@@ -1691,6 +1692,10 @@ PHP
 
     # Create a Child theme
     sudo wp scaffold child-theme ${WP_NEW_CHILD_SLUG:-} --parent_theme=${WP_PARENT_SLUG:-} --theme_name="${WP_CHILD_THEME_NAME:-}" --allow-root --force
+  elif [[ "${REPLY:-}" == 6 ]]; then
+    echo "Installing WordPres Plugin(s)..."
+    read -p "Enter plugin(s) name(s): " _WP_PLUGINS
+    sudo wp plugin install --allow-root --activate ${_WP_PLUGINS}
   else
     echo " Error: choose a number between 1 and 4"
   fi
