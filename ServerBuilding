@@ -1561,9 +1561,15 @@ wp_cli(){
         --dbprefix=${_WP_DB_PREF} \
         --extra-php <<PHP
 /**
+* Set the WordPress Memory Limit
+*/
+define( 'WP_MEMORY_LIMIT', '256M' );
+define( 'WP_MAX_MEMORY_LIMIT', '512M');
+
+/**
 * This tells WordPress to use an SSL connection to our MySQL database
 */
-define('MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL);
+define( 'MYSQL_CLIENT_FLAGS', MYSQLI_CLIENT_SSL );
 
 /**
 * Change the default autosave interval from 60 seconds to 5 minutes and set number (or disable) of post revisions
