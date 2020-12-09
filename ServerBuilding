@@ -1465,7 +1465,7 @@ wp_cli(){
   local _WP_PLUGINS=""
   # Extend more plugins
   # local _WP_PLUGINS="${_WP_PLUGINS} code-snippets wp-mail-smtp email-templates woocommerce elementor block-builder"
-  local _WP_THEMES="twentytwenty"
+  local _WP_THEMES="twentytwentyone"
 
   # Download WP-CLI
   if ! hash wp 2>/dev/null; then
