@@ -604,28 +604,31 @@ NGINXPHPADMIN
 # WordPress config
 ##
 
+# Redirect 403 HTTP status return code to 404
+error_page 403 =404 /404;
+
 # WordPress: allow TinyMCE
 # location = /wp-includes/js/tinymce/wp-tinymce.php {
 #     include /etc/nginx/snippets/fastcgi-php.conf;
 # }
 
 # WordPress: deny wp-content, wp-includes php files
-# location ~* ^/(?:wp-content|wp-includes)/.*\.php\$ {
-#     deny all;
-# }
+location ~* ^/(?:wp-content|wp-includes)/.*\.php\$ {
+    deny all;
+}
 
 # WordPress: deny wp-content/uploads nasty stuff
-# location ~* ^/wp-content/uploads/.*\.(?:s?html?|php|js|swf)\$ {
-#     deny all;
-# }
+location ~* ^/wp-content/uploads/.*\.(?:s?html?|php|js|swf)\$ {
+    deny all;
+}
 
 # WordPress: SEO plugin
-# location ~* ^/wp-content/plugins/wordpress-seo(?:-premium)?/css/main-sitemap\.xsl\$ {}
+location ~* ^/wp-content/plugins/wordpress-seo(?:-premium)?/css/main-sitemap\.xsl\$ {}
 
 # WordPress: deny wp-content/plugins (except earlier rules)
-# location ~ ^/wp-content/plugins {
-#     deny all;
-# }
+location ~ ^/wp-content/plugins {
+    deny all;
+}
 
 # WordPress: deny scripts and styles concat
 # location ~* \/wp-admin\/load-(?:scripts|styles)\.php {
@@ -633,9 +636,9 @@ NGINXPHPADMIN
 # }
 
 # WordPress: deny general stuff
-# location ~* ^/(?:xmlrpc\.php|wp-links-opml\.php|wp-config\.php|wp-config-sample\.php|wp-comments-post\.php|readme\.html|license\.txt)\$ {
-#     deny all;
-# }
+location ~* ^/(?:xmlrpc\.php|wp-links-opml\.php|wp-config\.php|wp-config-sample\.php|wp-comments-post\.php|readme\.html|license\.txt|olvasdel\.html|licenc\.txt)\$ {
+    deny all;
+}
 
 # WordPress: throttle wp-login.php
 location = /wp-login.php {
