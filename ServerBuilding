@@ -78,7 +78,7 @@ usage(){
                                (*.example.com >>> example.com)
   -s, --ssl <domain>         Create an SSL certificate for domain.
   -p, --path <custompath>    Set custom webrot path in /vat/www/<custompath>
-                               (default: /var/www/<domain>/punbic)
+                               (default: /var/www/<domain>/public)
   -m, --mysql                Install MySQL server.
       --mysql-add-user       Add MySQL user.
   -p, --php                  Install PHP-FPM.
@@ -759,8 +759,7 @@ VHOSTBLOCK
     listen                   443 ssl http2;
     listen                   [::]:443 ssl http2;
     server_name              ${_DOMAIN:-};
-    set                      \$base /var/www/${_DOMAIN:-};
-    root                     \$base/public;
+    root                     ${_PATH_WEBROOT:-};
 
     # SSL
     ssl_certificate          ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem;
@@ -840,7 +839,7 @@ server {
     listen                   443 ssl http2;
     listen                   [::]:443 ssl http2;
     server_name              cdn.${_DOMAIN:-};
-    root                     /var/www/${_DOMAIN:-}/public;
+    root                     ${_PATH_WEBROOT:-};
 
     # SSL
     ssl_certificate          ${_PATH_LETSENCRYPT_CERTIFICATE}${_DOMAIN:-}/fullchain.pem;
